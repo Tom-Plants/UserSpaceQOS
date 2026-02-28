@@ -29,6 +29,8 @@ pub struct MonitorQdisc<T, K> {
     pub inner: Box<dyn Qdisc<T, K>>,
     stats: HashMap<usize, QueueStats>,
     last_report: Instant,
+    // ✅ 新增：垃圾中转站
+    pending_drops: Vec<PacketContext<T, K>>,
 }
 
 impl<T, K> MonitorQdisc<T, K> {
@@ -38,25 +40,30 @@ impl<T, K> MonitorQdisc<T, K> {
             inner,
             stats: HashMap::new(),
             last_report: Instant::now(),
+            pending_drops: Vec::new(),
         }
     }
 
     // 🧹 专门负责去底层队列“收尸平账”的核心逻辑
     fn flush_internal_drops(&mut self) {
         let drops = self.inner.collect_dropped();
-        for ctx in drops {
-            let stat = self.stats.entry(ctx.queue_num).or_insert_with(QueueStats::default);
-            
+        for ctx in &drops {
+            let stat = self
+                .stats
+                .entry(ctx.queue_num)
+                .or_insert_with(QueueStats::default);
+
             // 记录一笔丢包
-            stat.drop_pkts += 1; 
-            
+            stat.drop_pkts += 1;
+
             // 🚨 核心平账：因为它曾经成功入队加了水位，现在死在里面了，必须把水位扣掉！
             stat.backlog_pkts -= 1;
             stat.backlog_bytes -= ctx.cost as i64;
-            
+
             // 可选：如果你想看暗杀细节，可以解开这行注释
             // println!("🔪 [回收站] 队列 {} 内部释放 {} 字节", ctx.queue_num, ctx.cost);
         }
+        self.pending_drops.extend(drops);
     }
 
     // 打印并重置报表
@@ -67,14 +74,25 @@ impl<T, K> MonitorQdisc<T, K> {
             let now_str = Local::now().format("%H:%M:%S").to_string();
 
             println!("\n📊 [{}] 监控面板: {}", now_str, self.name);
-            println!("---------------------------------------------------------------------------------");
+            println!(
+                "---------------------------------------------------------------------------------"
+            );
             println!(
                 "{:<8} | {:<10} | {:<10} | {:<10} | {:<10} | {:<15}",
-                "QueueNum", "入队(包/s)", "丢弃(包/s)", "出队(包/s)", "速度(Mbps)", "实时积压(包/KB)"
+                "QueueNum",
+                "入队(包/s)",
+                "丢弃(包/s)",
+                "出队(包/s)",
+                "速度(Mbps)",
+                "实时积压(包/KB)"
             );
-            println!("---------------------------------------------------------------------------------");
+            println!(
+                "---------------------------------------------------------------------------------"
+            );
 
-            let mut total_in = 0; let mut total_drop = 0; let mut total_out = 0;
+            let mut total_in = 0;
+            let mut total_drop = 0;
+            let mut total_out = 0;
             let mut total_bytes = 0.0;
             let mut total_backlog_bytes = 0;
 
@@ -89,7 +107,13 @@ impl<T, K> MonitorQdisc<T, K> {
 
                     println!(
                         "{:<8} | {:<10} | {:<10} | {:<10} | {:<10.2} | {}包 / {:.1}KB",
-                        q_num, stat.in_pkts, stat.drop_pkts, stat.out_pkts, mbps, stat.backlog_pkts, backlog_kb
+                        q_num,
+                        stat.in_pkts,
+                        stat.drop_pkts,
+                        stat.out_pkts,
+                        mbps,
+                        stat.backlog_pkts,
+                        backlog_kb
                     );
 
                     total_in += stat.in_pkts;
@@ -108,13 +132,17 @@ impl<T, K> MonitorQdisc<T, K> {
 
             let total_mbps = (total_bytes * 8.0) / 1_000_000.0 / elapsed.as_secs_f64();
             let total_backlog_kb = total_backlog_bytes as f64 / 1024.0;
-            
-            println!("---------------------------------------------------------------------------------");
+
+            println!(
+                "---------------------------------------------------------------------------------"
+            );
             println!(
                 "{:<8} | {:<10} | {:<10} | {:<10} | {:<10.2} | {:.1}KB 总积压",
                 "TOTAL", total_in, total_drop, total_out, total_mbps, total_backlog_kb
             );
-            println!("=================================================================================\n");
+            println!(
+                "=================================================================================\n"
+            );
 
             self.last_report = Instant::now();
         }
@@ -128,7 +156,7 @@ impl<T, K> Qdisc<T, K> for MonitorQdisc<T, K> {
     fn enqueue(&mut self, ctx: PacketContext<T, K>) -> Result<(), PacketContext<T, K>> {
         let q_num = ctx.queue_num;
         let cost = ctx.cost as i64;
-        
+
         let result = self.inner.enqueue(ctx);
         let stat = self.stats.entry(q_num).or_insert_with(QueueStats::default);
 
@@ -158,31 +186,28 @@ impl<T, K> Qdisc<T, K> for MonitorQdisc<T, K> {
         let result = self.inner.dequeue();
 
         if let Some(ref ctx) = result {
-            let stat = self.stats.entry(ctx.queue_num).or_insert_with(QueueStats::default);
+            let stat = self
+                .stats
+                .entry(ctx.queue_num)
+                .or_insert_with(QueueStats::default);
             stat.out_pkts += 1;
             stat.out_bytes += ctx.cost as f64;
-            
+
             // 正常出队，核销积压水位
             stat.backlog_pkts -= 1;
             stat.backlog_bytes -= ctx.cost as i64;
         }
 
         // 核心修复：清理那些在出队时被 `AckFilterWrapper` 暗杀，或者被 Fifo 超时丢弃的包！
-        self.flush_internal_drops(); 
-        
+        self.flush_internal_drops();
+
         self.check_and_report();
         result
     }
 
     fn collect_dropped(&mut self) -> Vec<PacketContext<T, K>> {
         // 如果外部有人主动调用，交出去之前也要平账
-        let drops = self.inner.collect_dropped();
-        for ctx in &drops {
-            let stat = self.stats.entry(ctx.queue_num).or_insert_with(QueueStats::default);
-            stat.drop_pkts += 1;
-            stat.backlog_pkts -= 1;
-            stat.backlog_bytes -= ctx.cost as i64;
-        }
-        drops
+        self.flush_internal_drops();
+        std::mem::take(&mut self.pending_drops)
     }
 }
