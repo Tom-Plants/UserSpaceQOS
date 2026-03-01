@@ -29,7 +29,7 @@ pub struct ClassDrrQdisc<T, K, C> {
 impl<T, K, C> ClassDrrQdisc<T, K, C>
 where
     K: Hash + Eq + Clone,
-    C: Hash + Eq + Clone
+    C: Hash + Eq + Clone,
 {
     pub fn new(
         // 🚀 注入的分类器：接收面单，告诉你它属于哪个 class_id，以及量子配额是多少
@@ -81,6 +81,7 @@ where
 
             if remove_class {
                 // 不重新插回 active_classes 即可
+                self.classes.remove(&class_id);
             } else if move_to_back {
                 self.active_classes.push_back(class_id);
             }
@@ -92,18 +93,13 @@ where
 // 实现统一的 Qdisc 接口
 // 入场券现在是: (大类ID, 大类Quantum, 传给底层的Param)
 // ==========================================
-impl<T, K, C> Qdisc<T, K>
-    for ClassDrrQdisc<T, K, C>
+impl<T, K, C> Qdisc<T, K> for ClassDrrQdisc<T, K, C>
 where
     K: Hash + Eq + Clone,
-    C: Hash + Eq + Clone
+    C: Hash + Eq + Clone,
 {
-
-    fn enqueue(
-        &mut self,
-        ctx: PacketContext<T, K>,
-    ) -> Result<(), PacketContext<T, K>> {
-        let (class_id, class_quantum ) = (self.classifier)(&ctx);
+    fn enqueue(&mut self, ctx: PacketContext<T, K>) -> Result<(), PacketContext<T, K>> {
+        let (class_id, class_quantum) = (self.classifier)(&ctx);
 
         // 【极其严谨的借用隔离，避免 Rust 报错】
         let (enqueue_result, is_new_or_was_empty) = {
@@ -156,19 +152,24 @@ where
         }
 
         let class_id = self.active_classes.pop_front()?;
-        let class = self.classes.get_mut(&class_id)?;
-
-        // ✅ 拆弹：安全提货，规避底层队列突然变空的风险
-        if let Some(ctx) = class.inner_qdisc.dequeue() {
+        
+        // 🚀 修复泄漏与借用冲突：分离“取包”和“删字典”的操作
+        let (ctx, is_empty) = {
+            let class = self.classes.get_mut(&class_id)?;
+            let ctx = class.inner_qdisc.dequeue()?;
             class.deficit -= ctx.cost as i32;
+            let empty = class.inner_qdisc.peek().is_none();
+            (ctx, empty)
+        };
 
-            if class.inner_qdisc.peek().is_some() {
-                self.active_classes.push_front(class_id);
-            }
-            Some(ctx)
+        if is_empty {
+            // 🚀 如果这一下掏空了底层队列，直接连根拔起销毁内存！
+            self.classes.remove(&class_id);
         } else {
-            None
+            self.active_classes.push_front(class_id);
         }
+
+        Some(ctx)
     }
 
     fn collect_dropped(&mut self) -> Vec<PacketContext<T, K>> {
