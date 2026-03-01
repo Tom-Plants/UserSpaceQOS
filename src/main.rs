@@ -16,7 +16,7 @@ use token_bucket::TokenBucket;
 
 use crate::{
     modifier::{
-        FragmentModifier, OverheadModifier, PacketModifier, PaddingModifier, TcpAckModifier,
+        FragmentModifier, OverheadModifier, PacketModifier, PaddingModifier, TcpAckModifier, TrueLengthModifier,
     },
     nfq_message::NfqMessage as Message,
     packet_context::PacketContext,
@@ -37,7 +37,7 @@ fn make_queue(queue_num: usize) -> Result<Queue, std::io::Error> {
     let mut q = Queue::open()?;
     let queue_num: u16 = queue_num as u16;
     q.bind(queue_num)?;
-    q.set_copy_range(queue_num, 0xFFFF)?;
+    q.set_copy_range(queue_num, 128)?;
     q.set_queue_max_len(queue_num, 10000)?;
     q.set_nonblocking(true);
     Ok(q)
@@ -59,6 +59,7 @@ fn main() {
         modifiers.insert(
             q,
             vec![
+                Box::new(TrueLengthModifier::new()),
                 Box::new(TcpAckModifier::new()),
                 Box::new(PaddingModifier::new(16)),
                 Box::new(FragmentModifier::new(WG_MTU)),
@@ -71,6 +72,7 @@ fn main() {
         modifiers.insert(
             q,
             vec![
+                Box::new(TrueLengthModifier::new()),
                 Box::new(TcpAckModifier::new()),
                 Box::new(FragmentModifier::new(ETH_MTU)),
                 Box::new(OverheadModifier::new(OVERHEAD2)),
@@ -164,13 +166,12 @@ fn main() {
                         no_packet = false;
 
                         let key = FiveTuple::from(msg.get_payload());
-                        let pkt_len = msg.get_payload().len();
 
                         let mut ctx = PacketContext {
                             msg: Message::from(msg),
                             key,
-                            pkt_len,
-                            cost: pkt_len,
+                            pkt_len: 0,
+                            cost: 0,
                             queue_num,
                             arrival_time: Instant::now(),
                             frames: 1,

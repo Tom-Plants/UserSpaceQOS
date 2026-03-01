@@ -16,23 +16,24 @@ struct ClassBuffer<T, K> {
     quantum: i32,
 }
 
-pub struct ClassDrrQdisc<T, K> {
-    classes: HashMap<usize, ClassBuffer<T, K>>,
-    active_classes: VecDeque<usize>,
+pub struct ClassDrrQdisc<T, K, C> {
+    classes: HashMap<C, ClassBuffer<T, K>>,
+    active_classes: VecDeque<C>,
     // 🚀 注入的分类器：接收面单，告诉你它属于哪个 class_id，以及量子配额是多少
-    classifier: Box<dyn Fn(&PacketContext<T, K>) -> (usize, i32)>,
+    classifier: Box<dyn Fn(&PacketContext<T, K>) -> (C, i32)>,
 
     // 🚀 注入的兵工厂：当发现新的 class_id 时，动态制造底层队列
     inner_factory: Box<dyn Fn() -> Box<dyn Qdisc<T, K>>>,
 }
 
-impl<T, K> ClassDrrQdisc<T, K>
+impl<T, K, C> ClassDrrQdisc<T, K, C>
 where
     K: Hash + Eq + Clone,
+    C: Hash + Eq + Clone
 {
     pub fn new(
         // 🚀 注入的分类器：接收面单，告诉你它属于哪个 class_id，以及量子配额是多少
-        classifier: Box<dyn Fn(&PacketContext<T, K>) -> (usize, i32)>,
+        classifier: Box<dyn Fn(&PacketContext<T, K>) -> (C, i32)>,
 
         // 🚀 注入的兵工厂：当发现新的 class_id 时，动态制造底层队列
         inner_factory: Box<dyn Fn() -> Box<dyn Qdisc<T, K>>>,
@@ -91,11 +92,13 @@ where
 // 实现统一的 Qdisc 接口
 // 入场券现在是: (大类ID, 大类Quantum, 传给底层的Param)
 // ==========================================
-impl<T, K> Qdisc<T, K>
-    for ClassDrrQdisc<T, K>
+impl<T, K, C> Qdisc<T, K>
+    for ClassDrrQdisc<T, K, C>
 where
     K: Hash + Eq + Clone,
+    C: Hash + Eq + Clone
 {
+
     fn enqueue(
         &mut self,
         ctx: PacketContext<T, K>,
@@ -106,7 +109,7 @@ where
         let (enqueue_result, is_new_or_was_empty) = {
             let mut was_empty = false;
 
-            let class = match self.classes.entry(class_id) {
+            let class = match self.classes.entry(class_id.clone()) {
                 Entry::Occupied(entry) => {
                     let c = entry.into_mut();
                     if c.inner_qdisc.peek().is_none() {
@@ -157,7 +160,7 @@ where
 
         // ✅ 拆弹：安全提货，规避底层队列突然变空的风险
         if let Some(ctx) = class.inner_qdisc.dequeue() {
-            class.deficit -= ctx.pkt_len as i32;
+            class.deficit -= ctx.cost as i32;
 
             if class.inner_qdisc.peek().is_some() {
                 self.active_classes.push_front(class_id);

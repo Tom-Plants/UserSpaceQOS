@@ -82,7 +82,7 @@ where
                 }
 
                 if let Some(ctx) = flow.queue.front() {
-                    let len = ctx.pkt_len as i32;
+                    let len = ctx.cost as i32;
                     if flow.deficit < len {
                         flow.deficit += flow.quantum;
                         move_to_back = true;
@@ -169,7 +169,7 @@ where
             let flow = self.flows.get_mut(&key)?;
             let ctx = flow.queue.pop_front()?;
 
-            let len = ctx.pkt_len as i32;
+            let len = ctx.cost as i32;
             flow.deficit -= len;
 
             (ctx, flow.queue.is_empty(), flow.group_id)
