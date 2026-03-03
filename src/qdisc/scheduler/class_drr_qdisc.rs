@@ -24,6 +24,7 @@ pub struct ClassDrrQdisc<T, K, C> {
 
     // 🚀 注入的兵工厂：当发现新的 class_id 时，动态制造底层队列
     inner_factory: Box<dyn Fn() -> Box<dyn Qdisc<T, K>>>,
+    pending_drops: Vec<PacketContext<T, K>>,
 }
 
 impl<T, K, C> ClassDrrQdisc<T, K, C>
@@ -43,12 +44,14 @@ where
             active_classes: VecDeque::new(),
             classifier,
             inner_factory,
+            pending_drops: Vec::new(),
         }
     }
 
     // 状态机：寻找下一个有钱发包的大类
     fn prepare_next_ready_class(&mut self) -> bool {
         loop {
+            // ... 前面获取 class_id 保持不变
             let class_id = match self.active_classes.pop_front() {
                 Some(id) => id,
                 None => return false,
@@ -58,29 +61,28 @@ where
             let mut move_to_back = false;
 
             if let Some(class) = self.classes.get_mut(&class_id) {
-                // ✅ 无论 Inner 是什么，只要它实现了 Qdisc，就能 peek
                 if let Some(ctx) = class.inner_qdisc.peek() {
                     let len = ctx.cost as i32;
-
                     if class.deficit < len {
-                        // 钱不够，充值排到队尾
                         class.deficit += class.quantum;
                         move_to_back = true;
                     } else {
-                        // 钱够，锁定它
                         self.active_classes.push_front(class_id);
                         return true;
                     }
                 } else {
-                    // 底层队列空了
                     remove_class = true;
                 }
+
+                // 🚀 核心：无论它是否要被销毁，都把它的垃圾桶掏空！
+                self.pending_drops
+                    .extend(class.inner_qdisc.collect_dropped());
             } else {
                 continue;
             }
 
+            // 存入大类的收容所
             if remove_class {
-                // 不重新插回 active_classes 即可
                 self.classes.remove(&class_id);
             } else if move_to_back {
                 self.active_classes.push_back(class_id);
@@ -98,44 +100,39 @@ where
     K: Hash + Eq + Clone,
     C: Hash + Eq + Clone,
 {
-    fn enqueue(&mut self, ctx: PacketContext<T, K>) -> Result<(), PacketContext<T, K>> {
+    fn enqueue(&mut self, ctx: PacketContext<T, K>) -> () {
         let (class_id, class_quantum) = (self.classifier)(&ctx);
 
         // 【极其严谨的借用隔离，避免 Rust 报错】
-        let (enqueue_result, is_new_or_was_empty) = {
-            let mut was_empty = false;
+        let mut was_empty = false;
 
-            let class = match self.classes.entry(class_id.clone()) {
-                Entry::Occupied(entry) => {
-                    let c = entry.into_mut();
-                    if c.inner_qdisc.peek().is_none() {
-                        was_empty = true;
-                    }
-                    c
-                }
-                Entry::Vacant(entry) => {
+        let class = match self.classes.entry(class_id.clone()) {
+            Entry::Occupied(entry) => {
+                let c = entry.into_mut();
+                if c.inner_qdisc.peek().is_none() {
                     was_empty = true;
-                    entry.insert(ClassBuffer {
-                        inner_qdisc: (self.inner_factory)(), // ✅ 动态制造底层的队列
-                        deficit: class_quantum,
-                        quantum: class_quantum,
-                    })
                 }
-            };
-
-            class.quantum = class_quantum; // 更新大类配额
-
-            // ✅ 把 inner_param 完美透传给底层的入队逻辑
-            let res = class.inner_qdisc.enqueue(ctx);
-            (res, was_empty)
+                c
+            }
+            Entry::Vacant(entry) => {
+                was_empty = true;
+                entry.insert(ClassBuffer {
+                    inner_qdisc: (self.inner_factory)(), // ✅ 动态制造底层的队列
+                    deficit: class_quantum,
+                    quantum: class_quantum,
+                })
+            }
         };
 
+        class.quantum = class_quantum; // 更新大类配额
+
+        // ✅ 把 inner_param 完美透传给底层的入队逻辑
+        class.inner_qdisc.enqueue(ctx);
+
         // 如果入队成功，且它原本是空的，激活这个大类
-        if enqueue_result.is_ok() && is_new_or_was_empty {
+        if was_empty {
             self.active_classes.push_front(class_id);
         }
-
-        enqueue_result
     }
 
     fn peek(&mut self) -> Option<&PacketContext<T, K>> {
@@ -147,33 +144,49 @@ where
     }
 
     fn dequeue(&mut self) -> Option<PacketContext<T, K>> {
-        if !self.prepare_next_ready_class() {
-            return None;
+        loop {
+            if !self.prepare_next_ready_class() {
+                return None;
+            }
+
+            let class_id = self.active_classes.pop_front()?;
+
+            // 🚀 分离借用，同时掏出包、判断空、收集垃圾
+            let (ctx_opt, is_empty, rescued_drops) = {
+                let class = self.classes.get_mut(&class_id)?;
+                let ctx_opt = class.inner_qdisc.dequeue();
+
+                if let Some(ctx) = &ctx_opt {
+                    class.deficit -= ctx.cost as i32;
+                }
+
+                let empty = class.inner_qdisc.peek().is_none();
+                // 🚀 在可能 remove 它之前，强制掏空垃圾桶
+                let drops = class.inner_qdisc.collect_dropped();
+
+                (ctx_opt, empty, drops)
+            };
+
+            // 存入收容所
+            self.pending_drops.extend(rescued_drops);
+
+            if is_empty {
+                self.classes.remove(&class_id);
+            } else {
+                self.active_classes.push_front(class_id);
+            }
+
+            if let Some(ctx) = ctx_opt {
+                return Some(ctx);
+            }
         }
-
-        let class_id = self.active_classes.pop_front()?;
-        
-        // 🚀 修复泄漏与借用冲突：分离“取包”和“删字典”的操作
-        let (ctx, is_empty) = {
-            let class = self.classes.get_mut(&class_id)?;
-            let ctx = class.inner_qdisc.dequeue()?;
-            class.deficit -= ctx.cost as i32;
-            let empty = class.inner_qdisc.peek().is_none();
-            (ctx, empty)
-        };
-
-        if is_empty {
-            // 🚀 如果这一下掏空了底层队列，直接连根拔起销毁内存！
-            self.classes.remove(&class_id);
-        } else {
-            self.active_classes.push_front(class_id);
-        }
-
-        Some(ctx)
     }
 
     fn collect_dropped(&mut self) -> Vec<PacketContext<T, K>> {
-        let mut all_drops = Vec::new();
+        // 🚀 1. 把之前摸尸攒下来的存货拿出来
+        let mut all_drops = std::mem::take(&mut self.pending_drops);
+
+        // 🚀 2. 顺便搜刮一下当前还活着的子队列
         for class in self.classes.values_mut() {
             all_drops.extend(class.inner_qdisc.collect_dropped());
         }

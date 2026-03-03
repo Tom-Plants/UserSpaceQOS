@@ -16,14 +16,10 @@ pub struct SparseQdisc<T, K> {
 
     // 3. 全知计步器
     flow_counts: HashMap<K, usize>,
-
 }
 
 impl<T, K> SparseQdisc<T, K> {
-    pub fn new(
-        sparse_qdisc: Box<dyn Qdisc<T, K>>,
-        bulk_qdisc: Box<dyn Qdisc<T, K>>,
-    ) -> Self {
+    pub fn new(sparse_qdisc: Box<dyn Qdisc<T, K>>, bulk_qdisc: Box<dyn Qdisc<T, K>>) -> Self {
         Self {
             sparse_qdisc,
             bulk_qdisc,
@@ -36,15 +32,11 @@ impl<T, K> SparseQdisc<T, K> {
 // 实现统一的 Qdisc 接口
 // ✅ 参数变成了元组 (SparseParam, BulkParam)，分别喂给两个底层
 // ==========================================
-impl<T, K> Qdisc<T, K>
-    for SparseQdisc<T, K>
+impl<T, K> Qdisc<T, K> for SparseQdisc<T, K>
 where
     K: Hash + Eq + Clone,
 {
-    fn enqueue(
-        &mut self,
-        ctx: PacketContext<T, K>,
-    ) -> Result<(), PacketContext<T, K>> {
+    fn enqueue(&mut self, ctx: PacketContext<T, K>) {
         let key = ctx.key.clone();
         let current_count = self.flow_counts.get(&key).copied().unwrap_or(0);
 
@@ -52,25 +44,15 @@ where
             // =====================================
             // 稀疏流判定！扔进泛型的 VIP 通道
             // =====================================
-            match self.sparse_qdisc.enqueue(ctx) {
-                Ok(()) => {
-                    self.flow_counts.insert(key, 1);
-                    Ok(())
-                }
-                Err(rejected_ctx) => Err(rejected_ctx), // 如果 VIP 通道物理爆满，退回
-            }
+            self.sparse_qdisc.enqueue(ctx);
+            self.flow_counts.insert(key, 1);
         } else {
             // =====================================
             // 贪婪流判定！降级踢进底层苦力营
             // =====================================
-            match self.bulk_qdisc.enqueue(ctx) {
-                Ok(()) => {
-                    if let Some(count) = self.flow_counts.get_mut(&key) {
-                        *count += 1;
-                    }
-                    Ok(())
-                }
-                Err(rejected_ctx) => Err(rejected_ctx),
+            self.bulk_qdisc.enqueue(ctx);
+            if let Some(count) = self.flow_counts.get_mut(&key) {
+                *count += 1;
             }
         }
     }

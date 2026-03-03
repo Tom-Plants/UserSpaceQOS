@@ -16,13 +16,16 @@ use token_bucket::TokenBucket;
 
 use crate::{
     modifier::{
-        FragmentModifier, OverheadModifier, PacketModifier, PaddingModifier, TcpAckModifier, TrueLengthModifier,
+        FragmentModifier, OverheadModifier, PacketModifier, PaddingModifier, TcpAckModifier,
+        TrueLengthModifier,
     },
     nfq_message::NfqMessage as Message,
     packet_context::PacketContext,
     qdisc::{
-        ClassDrrQdisc, DrrQdisc, DualFairQdisc, FifoQdisc, MonitorQdisc, Qdisc, RootHtbQdisc,
-        SparseQdisc, TcpAckFilterQdisc,
+        Qdisc,
+        leaf::TTLHeadDropQdisc,
+        scheduler::{ClassDrrQdisc, DualFairQdisc, PrioQdisc, SparseQdisc},
+        wrapper::{MonitorQdisc, RateLimitQdisc, TcpAckFilterQdisc},
     },
 };
 
@@ -87,27 +90,45 @@ fn main() {
     //    - 内部的小包流走 Fifo
     //    - 内部的大文件流走 Drr (公平分配，量子设为 1500)
     let default_qdisc = {
-        let sparse_leaf: Box<dyn Qdisc<Message, FiveTuple>> = Box::new(FifoQdisc::new(10, 2048));
+        let sparse_leaf: Box<dyn Qdisc<Message, FiveTuple>> = Box::new(MonitorQdisc::new(
+            "Sparse",
+            Box::new(TTLHeadDropQdisc::new(10, 2048)),
+        ));
         let class_bulk_leaf: Box<dyn Qdisc<Message, FiveTuple>> = Box::new(ClassDrrQdisc::new(
             Box::new(
                 |ctx: &PacketContext<Message, FiveTuple>| match ctx.queue_num {
-                    0 | 4 => (0, 1500),
-                    1 | 5 => (1, 15000),
+                    0 | 1 => (ctx.key.dst, 1500),
+                    4 | 5 => (ctx.key.src, 1500),
                     _ => panic!(),
                 },
             ),
-            Box::new(|| Box::new(DrrQdisc::new(100, 2048, 1500))),
+            Box::new(|| {
+                Box::new(ClassDrrQdisc::new(
+                    Box::new(|ctx: &PacketContext<Message, FiveTuple>| (ctx.key.clone(), 1500)),
+                    Box::new(|| Box::new(TTLHeadDropQdisc::new(100, 2048))),
+                ))
+            }),
         ));
-        let class_bulk_leaf_ack_filter = Box::new(TcpAckFilterQdisc::new(class_bulk_leaf));
-        Box::new(SparseQdisc::new(sparse_leaf, class_bulk_leaf_ack_filter))
+        let class_bulk_leaf_ack_filter = Box::new(MonitorQdisc::new(
+            "Bulk",
+            Box::new(TcpAckFilterQdisc::new(class_bulk_leaf)),
+        ));
+        Box::new(MonitorQdisc::new(
+            "LOW",
+            Box::new(SparseQdisc::new(sparse_leaf, class_bulk_leaf_ack_filter)),
+        ))
     };
 
     let high_qdisc = {
-        let sparse_leaf: Box<dyn Qdisc<Message, FiveTuple>> = Box::new(FifoQdisc::new(10, 2048));
-        let drr_leaf: Box<dyn Qdisc<Message, FiveTuple>> = Box::new(DrrQdisc::new(100, 2048, 1500));
+        let sparse_leaf: Box<dyn Qdisc<Message, FiveTuple>> =
+            Box::new(TTLHeadDropQdisc::new(10, 2048));
+        let drr_leaf: Box<dyn Qdisc<Message, FiveTuple>> = Box::new(ClassDrrQdisc::new(
+            Box::new(|ctx: &PacketContext<Message, FiveTuple>| (ctx.key.clone(), 1500)),
+            Box::new(|| Box::new(TTLHeadDropQdisc::new(100, 2048))),
+        ));
         let drr_leaf_ack_filter = Box::new(TcpAckFilterQdisc::new(drr_leaf));
         let long_leaf = Box::new(SparseQdisc::new(sparse_leaf, drr_leaf_ack_filter));
-        let short_leaf = Box::new(FifoQdisc::new(10, 2048));
+        let short_leaf = Box::new(TTLHeadDropQdisc::new(10, 2048));
 
         Box::new(DualFairQdisc::new(
             short_leaf,
@@ -120,29 +141,39 @@ fn main() {
             }),
         ))
     };
-    // let high_bulk_leaf: Box<dyn Qdisc<Message, FiveTuple>> =
-    //     Box::new(DrrQdisc::new(500, 2048, 1500));
 
-    // let high_qdisc: Box<dyn Qdisc<Message, FiveTuple>> =
-    //     Box::new(SparseQdisc::new(high_sparse_leaf, high_bulk_leaf));
-
-    // 默认通道的入口是 SparseQdisc，阈值设为 500KB
-
-    // 3. 构建顶级 HTB 限速网关，并【注入分类器闭包】！
-    let root_htb: RootHtbQdisc<Message, FiveTuple, TokenBucket, TokenBucket> = RootHtbQdisc::new(
-        high_qdisc,
-        default_qdisc,
+    let root = RateLimitQdisc::new(
+        Box::new(PrioQdisc::new(
+            Box::new(RateLimitQdisc::new(
+                high_qdisc,
+                high_priority_bucket,
+                Box::new(|_| 0),
+            )),
+            default_qdisc,
+            Box::new(|ctx| ctx.queue_num == 2 || ctx.queue_num == 3),
+        )),
         global_bucket,
-        high_priority_bucket,
-        high_priority_burst as usize,
-        // 🌟 灵魂注入：分类规则！只要是队列 2 (Sunshine)，就是 VIP！
-        Box::new(|ctx: &PacketContext<Message, FiveTuple>| {
-            ctx.queue_num == 2 || ctx.queue_num == 3
+        Box::new(move |ctx| match ctx.queue_num {
+            2 | 3 => 0,
+            _ => high_priority_burst as usize,
         }),
     );
 
+    // 3. 构建顶级 HTB 限速网关，并【注入分类器闭包】！
+    // let root_htb: RootHtbQdisc<Message, FiveTuple, TokenBucket, TokenBucket> = RootHtbQdisc::new(
+    //     high_qdisc,
+    //     default_qdisc,
+    //     global_bucket,
+    //     high_priority_bucket,
+    //     high_priority_burst as usize,
+    //     // 🌟 灵魂注入：分类规则！只要是队列 2 (Sunshine)，就是 VIP！
+    //     Box::new(|ctx: &PacketContext<Message, FiveTuple>| {
+    //         ctx.queue_num == 2 || ctx.queue_num == 3
+    //     }),
+    // );
+
     // 4. 最外层套上监控大屏
-    let mut pipeline = MonitorQdisc::new("RootPipeline", Box::new(root_htb));
+    let mut pipeline = root;
 
     let mut queues: Vec<Queue> = (0..6)
         .map(|i| make_queue(i).expect("failed to create queue"))
@@ -185,14 +216,7 @@ fn main() {
                             }
                         }
 
-                        match pipeline.enqueue(ctx) {
-                            Ok(()) => (),
-                            Err(msg) => {
-                                let mut msg: InnerMessage = msg.msg.into();
-                                msg.set_verdict(Verdict::Drop);
-                                queues[i].verdict(msg).ok();
-                            }
-                        }
+                        pipeline.enqueue(ctx);
                     }
                     Err(_) => {
                         continue;

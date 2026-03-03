@@ -6,14 +6,14 @@ use crate::{packet_context::PacketContext, qdisc::Qdisc};
 // ==========================================
 // 基于时间的 FIFO 调度器
 // ==========================================
-pub struct FifoQdisc<T, K> {
+pub struct TTLHeadDropQdisc<T, K> {
     queue: VecDeque<PacketContext<T, K>>,
     max_latency: Duration,                     // ✅ 保鲜期
     hard_limit: usize,                         // ✅ 物理兜底
     pending_expired: Vec<PacketContext<T, K>>, // ✅ 垃圾桶
 }
 
-impl<T, K> FifoQdisc<T, K> {
+impl<T, K> TTLHeadDropQdisc<T, K> {
     pub fn new(max_latency_ms: u64, hard_limit: usize) -> Self {
         Self {
             queue: VecDeque::new(),
@@ -24,17 +24,17 @@ impl<T, K> FifoQdisc<T, K> {
     }
 }
 
-impl<T, K> Qdisc<T, K> for FifoQdisc<T, K> {
-    fn enqueue(&mut self, ctx: PacketContext<T, K>) -> Result<(), PacketContext<T, K>> {
+impl<T, K> Qdisc<T, K> for TTLHeadDropQdisc<T, K> {
+    fn enqueue(&mut self, ctx: PacketContext<T, K>) -> () {
         if self.queue.len() >= self.hard_limit {
             // Drop-Head: 踢掉最老的，让新的进
             if let Some(old_ctx) = self.queue.pop_front() {
                 self.queue.push_back(ctx);
-                return Err(old_ctx);
+                self.pending_expired.push(old_ctx);
+                return;
             }
         }
         self.queue.push_back(ctx);
-        Ok(())
     }
 
     fn peek(&mut self) -> Option<&PacketContext<T, K>> {

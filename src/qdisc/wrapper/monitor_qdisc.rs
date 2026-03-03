@@ -153,29 +153,19 @@ impl<T, K> MonitorQdisc<T, K> {
 // 3. 实现 Qdisc 接口 (拦截、更新、平账)
 // ==========================================
 impl<T, K> Qdisc<T, K> for MonitorQdisc<T, K> {
-    fn enqueue(&mut self, ctx: PacketContext<T, K>) -> Result<(), PacketContext<T, K>> {
+    fn enqueue(&mut self, ctx: PacketContext<T, K>) {
         let q_num = ctx.queue_num;
         let cost = ctx.cost as i64;
 
-        let result = self.inner.enqueue(ctx);
+        self.inner.enqueue(ctx);
         let stat = self.stats.entry(q_num).or_insert_with(QueueStats::default);
 
-        match result {
-            Ok(()) => {
-                stat.in_pkts += 1;
-                // 注意：哪怕包最后会被 Fifo 丢掉，既然它 enqueue 成功了，我们先把它算进积压水位里
-                stat.backlog_pkts += 1;
-                stat.backlog_bytes += cost;
-            }
-            Err(_) => {
-                // 这是直接被外层拒绝（比如 HTB 队列满了直接弹回）的情况
-                stat.drop_pkts += 1;
-            }
-        }
+        stat.in_pkts += 1;
+        stat.backlog_pkts += 1;
+        stat.backlog_bytes += cost;
 
         self.flush_internal_drops(); // 入队也可能触发内部超时丢包，顺手收尸
         self.check_and_report();
-        result
     }
 
     fn peek(&mut self) -> Option<&PacketContext<T, K>> {

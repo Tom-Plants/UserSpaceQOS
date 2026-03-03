@@ -29,7 +29,7 @@ impl<T, K: Clone + std::hash::Hash + Eq> TcpAckFilterQdisc<T, K> {
 
 // 🚀 套管实现：拦截出入动作
 impl<T, K: Clone + std::hash::Hash + Eq> Qdisc<T, K> for TcpAckFilterQdisc<T, K> {
-    fn enqueue(&mut self, ctx: PacketContext<T, K>) -> Result<(), PacketContext<T, K>> {
+    fn enqueue(&mut self, ctx: PacketContext<T, K>) {
         self.packet_counter += 1;
 
         // 🚀 每处理 1024 个包，执行一次扫地机器人，清理 120 秒前的死连接

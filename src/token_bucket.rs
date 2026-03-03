@@ -9,9 +9,9 @@ pub trait TokenBucketLimiter {
 }
 
 pub struct TokenBucket {
-    pub tokens: f64,   // 当前余额
-    rate: f64,     // 速率 (字节/秒)
-    capacity: f64, // 桶容量 (突发限制)
+    pub tokens: f64, // 当前余额
+    rate: f64,       // 速率 (字节/秒)
+    capacity: f64,   // 桶容量 (突发限制)
     last_update: Instant,
     _name: String,
 }
@@ -64,5 +64,4 @@ impl TokenBucketLimiter for TokenBucket {
         self.refill();
         self.tokens >= amount as f64
     }
-    
 }

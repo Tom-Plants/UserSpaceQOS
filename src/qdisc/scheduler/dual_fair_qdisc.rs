@@ -37,35 +37,34 @@ impl<T, K> DualFairQdisc<T, K> {
 
     /// 核心状态机：寻找下一个有钱且有包的队列
     fn prepare_next(&mut self) -> bool {
-        // 如果两个都空了，直接返回 false，并清空账本防止积攒烂账
-        if self.q_a.peek().is_none() && self.q_b.peek().is_none() {
-            self.deficit_a = 0;
-            self.deficit_b = 0;
-            return false;
-        }
-
-        // 轮询充值发工资，直到有人能买得起当前队头的包
         loop {
+            // 🚀 核心修复：每次循环都查一次，防止底层偷偷把包扔了导致两边全空！
+            if self.q_a.peek().is_none() && self.q_b.peek().is_none() {
+                self.deficit_a = 0;
+                self.deficit_b = 0;
+                return false;
+            }
+
             if self.turn_a {
                 if let Some(ctx) = self.q_a.peek() {
                     if self.deficit_a >= ctx.cost as i32 {
-                        return true; // A 钱够了，准备提货
+                        return true;
                     }
-                    self.deficit_a += self.quantum; // 钱不够，发工资
+                    self.deficit_a += self.quantum;
                 } else {
-                    self.deficit_a = 0; // A 没包，余额直接清空
+                    self.deficit_a = 0;
                 }
-                self.turn_a = false; // 切换回合
+                self.turn_a = false;
             } else {
                 if let Some(ctx) = self.q_b.peek() {
                     if self.deficit_b >= ctx.cost as i32 {
-                        return true; // B 钱够了，准备提货
+                        return true;
                     }
                     self.deficit_b += self.quantum;
                 } else {
                     self.deficit_b = 0;
                 }
-                self.turn_a = true; // 切换回合
+                self.turn_a = true;
             }
         }
     }
@@ -73,7 +72,7 @@ impl<T, K> DualFairQdisc<T, K> {
 
 // 极其纯粹的入队出队实现
 impl<T, K> Qdisc<T, K> for DualFairQdisc<T, K> {
-    fn enqueue(&mut self, ctx: PacketContext<T, K>) -> Result<(), PacketContext<T, K>> {
+    fn enqueue(&mut self, ctx: PacketContext<T, K>) {
         if (self.classifier)(&ctx) {
             self.q_a.enqueue(ctx)
         } else {
