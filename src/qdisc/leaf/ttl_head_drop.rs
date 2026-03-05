@@ -3,9 +3,6 @@ use std::time::{Duration, Instant};
 
 use crate::{packet_context::PacketContext, qdisc::Qdisc};
 
-// ==========================================
-// 基于时间的 FIFO 调度器
-// ==========================================
 pub struct TTLHeadDropQdisc<T, K> {
     queue: VecDeque<PacketContext<T, K>>,
     max_latency: Duration,                     // ✅ 保鲜期

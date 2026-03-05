@@ -201,3 +201,138 @@ impl<T, K> Qdisc<T, K> for MonitorQdisc<T, K> {
         std::mem::take(&mut self.pending_drops)
     }
 }
+
+#[cfg(test)]
+mod monitor_qdisc_tests {
+    use super::*;
+    use std::collections::VecDeque;
+    use std::time::Instant;
+
+    // ==========================================
+    // 辅助工具
+    // ==========================================
+
+    fn make_pkt(msg: &'static str, queue_num: usize, cost: usize) -> PacketContext<&'static str, u32> {
+        PacketContext {
+            msg,
+            key: 1, // Monitor 不看 key，只看 queue_num
+            pkt_len: cost,
+            cost,
+            queue_num,
+            arrival_time: Instant::now(),
+            frames: 1,
+            is_pure_ack: false,
+            tcp_ack_num: 0,
+        }
+    }
+
+    // 专属 Mock 队列：硬性容量限制，专门用来触发丢包测试 Monitor 的“平账”能力
+    struct MockLimitQdisc {
+        queue: VecDeque<PacketContext<&'static str, u32>>,
+        limit: usize,
+        drops: Vec<PacketContext<&'static str, u32>>,
+    }
+    impl MockLimitQdisc {
+        fn new(limit: usize) -> Self {
+            Self { queue: VecDeque::new(), limit, drops: Vec::new() }
+        }
+    }
+    impl Qdisc<&'static str, u32> for MockLimitQdisc {
+        fn enqueue(&mut self, ctx: PacketContext<&'static str, u32>) {
+            if self.queue.len() >= self.limit {
+                if let Some(drop) = self.queue.pop_front() {
+                    self.drops.push(drop); // 触发 Drop-Head
+                }
+            }
+            self.queue.push_back(ctx);
+        }
+        fn peek(&mut self) -> Option<&PacketContext<&'static str, u32>> { self.queue.front() }
+        fn dequeue(&mut self) -> Option<PacketContext<&'static str, u32>> { self.queue.pop_front() }
+        fn collect_dropped(&mut self) -> Vec<PacketContext<&'static str, u32>> {
+            std::mem::take(&mut self.drops)
+        }
+    }
+
+    // ==========================================
+    // 财务核算测试用例
+    // ==========================================
+
+    #[test]
+    fn test_monitor_basic_accounting() {
+        // 容量给够，不触发丢包
+        let inner = Box::new(MockLimitQdisc::new(10));
+        let mut monitor = MonitorQdisc::new("eth0-mon", inner);
+
+        // 队列 10 进两个包
+        monitor.enqueue(make_pkt("P1", 10, 100));
+        monitor.enqueue(make_pkt("P2", 10, 200));
+
+        // 验证记账：入队应该增加 in_pkts 和 backlog
+        let stat = monitor.stats.get(&10).unwrap();
+        assert_eq!(stat.in_pkts, 2, "收到 2 个包");
+        assert_eq!(stat.backlog_pkts, 2, "积压 2 个包");
+        assert_eq!(stat.backlog_bytes, 300, "积压 300 字节");
+        assert_eq!(stat.out_pkts, 0);
+
+        // 出队一个包
+        let out = monitor.dequeue().unwrap();
+        assert_eq!(out.msg, "P1");
+
+        // 验证平账：出队后 backlog 应该扣除，out_pkts 增加
+        let stat_after = monitor.stats.get(&10).unwrap();
+        assert_eq!(stat_after.out_pkts, 1, "发出 1 个包");
+        assert_eq!(stat_after.out_bytes, 100.0, "发出 100 字节");
+        assert_eq!(stat_after.backlog_pkts, 1, "积压还剩 1 个包");
+        assert_eq!(stat_after.backlog_bytes, 200, "积压还剩 200 字节");
+    }
+
+    #[test]
+    fn test_monitor_drop_compensation() {
+        // 🚨 核心测试：测试底层丢包时的“平账”逻辑
+        // 底层队列容量只有 2
+        let inner = Box::new(MockLimitQdisc::new(2));
+        let mut monitor = MonitorQdisc::new("eth0-mon", inner);
+
+        // 塞入 3 个包，第 3 个包入队时，底层会把第 1 个包踢进垃圾桶
+        monitor.enqueue(make_pkt("P1", 20, 100)); // 被踢
+        monitor.enqueue(make_pkt("P2", 20, 100)); // 存活
+        monitor.enqueue(make_pkt("P3", 20, 100)); // 存活
+
+        // 取出状态报表
+        let stat = monitor.stats.get(&20).unwrap();
+
+        // 见证奇迹的时刻：
+        assert_eq!(stat.in_pkts, 3, "历史总共入队尝试了 3 个");
+        assert_eq!(stat.drop_pkts, 1, "成功察觉到底层丢了 1 个包");
+        
+        // 最关键的平账验证：(3个入队) - (1个丢弃) = (当前真实积压水位)
+        assert_eq!(stat.backlog_pkts, 2, "物理水位被精准修正为 2");
+        assert_eq!(stat.backlog_bytes, 200, "物理水位字节数被精准修正为 200");
+
+        // 主动收取外层垃圾
+        let drops = monitor.collect_dropped();
+        assert_eq!(drops.len(), 1, "外部也应该能顺利拿到被丢的包");
+        assert_eq!(drops[0].msg, "P1");
+    }
+
+    #[test]
+    fn test_monitor_multi_queue_isolation() {
+        let inner = Box::new(MockLimitQdisc::new(10));
+        let mut monitor = MonitorQdisc::new("eth0-mon", inner);
+
+        // 分别向队列 100 和 200 发包
+        monitor.enqueue(make_pkt("Q100-P1", 100, 50));
+        monitor.enqueue(make_pkt("Q200-P1", 200, 60));
+        monitor.enqueue(make_pkt("Q200-P2", 200, 70));
+
+        assert_eq!(monitor.stats.len(), 2, "应该生成了两个独立的账本");
+
+        let stat_100 = monitor.stats.get(&100).unwrap();
+        assert_eq!(stat_100.in_pkts, 1);
+        assert_eq!(stat_100.backlog_bytes, 50);
+
+        let stat_200 = monitor.stats.get(&200).unwrap();
+        assert_eq!(stat_200.in_pkts, 2);
+        assert_eq!(stat_200.backlog_bytes, 130);
+    }
+}
