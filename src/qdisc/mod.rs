@@ -7,6 +7,7 @@ pub mod wrapper;
 pub trait Qdisc<T, K> {
     fn enqueue(&mut self, ctx: PacketContext<T, K>) -> ();
     fn peek(&mut self) -> Option<&PacketContext<T, K>>;
+    //执行dequeue前，必须先执行peek做检查
     fn dequeue(&mut self) -> Option<PacketContext<T, K>>;
     fn collect_dropped(&mut self) -> Vec<PacketContext<T, K>> {
         Vec::new()

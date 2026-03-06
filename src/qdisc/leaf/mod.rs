@@ -1,3 +1,3 @@
-mod ttl_head_drop;
+mod head_drop_fifo;
 
-pub use ttl_head_drop::TTLHeadDropQdisc;
+pub use head_drop_fifo::HeadDropFifo;

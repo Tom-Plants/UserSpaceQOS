@@ -37,10 +37,7 @@ where
 
     fn peek(&mut self) -> Option<&PacketContext<T, K>> {
         if let Some(ctx) = self.inner.peek() {
-            // 🚀 核心逻辑 1：计算这个包的提款门槛
             let reserve_bytes = (self.reserve_fn)(ctx);
-
-            // 桶里的钱，必须大于等于：包的真实运费 + 强制保留的备用金
             if self.bucket.can_spend(ctx.cost + reserve_bytes) {
                 return Some(ctx);
             }
@@ -49,20 +46,10 @@ where
     }
 
     fn dequeue(&mut self) -> Option<PacketContext<T, K>> {
-        if let Some(ctx) = self.inner.peek() {
-            let reserve_bytes = (self.reserve_fn)(ctx);
-
-            // 再次确认：钱够不够运费 + 备用金
-            if self.bucket.can_spend(ctx.cost + reserve_bytes) {
-                if let Some(real_ctx) = self.inner.dequeue() {
-                    // 🚀 核心逻辑 2：真实扣费时，只扣真实运费！
-                    // 备用金只是“门槛”，不需要真的花掉它
-                    self.bucket.consume(real_ctx.cost);
-                    return Some(real_ctx);
-                }
-            }
-        }
-        None
+        // 🚀 盲提货：省去所有重新计算 reserve 和 can_spend 的逻辑
+        let ctx = self.inner.dequeue()?;
+        self.bucket.consume(ctx.cost); // 只扣净重
+        Some(ctx)
     }
 
     fn collect_dropped(&mut self) -> Vec<PacketContext<T, K>> {
