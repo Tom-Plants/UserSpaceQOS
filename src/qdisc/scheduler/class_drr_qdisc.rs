@@ -121,17 +121,15 @@ where
         }
     }
 
-    fn dequeue(&mut self) -> Option<PacketContext<T, K>> {
-        // 🚀 极致盲从：刚 peek 过，队头绝对有钱有货！
-        let class_id = self.active_classes.front()?.clone();
-        let class = self.classes.get_mut(&class_id)?;
-
-        let ctx = class.inner_qdisc.dequeue()?;
-
-        // 乖乖扣费
+    fn dequeue(&mut self) -> PacketContext<T, K> {
+        // 🚀 极致信任：只要走到这里，active_classes 必有货，内部 Qdisc 必有货！
+        let class_id = self.active_classes.front().unwrap().clone();
+        let class = self.classes.get_mut(&class_id).unwrap();
+        
+        let ctx = class.inner_qdisc.dequeue(); // 必然成功
         class.deficit -= ctx.cost as i32;
-
-        Some(ctx)
+        
+        ctx
     }
 
     fn collect_dropped(&mut self) -> Vec<PacketContext<T, K>> {

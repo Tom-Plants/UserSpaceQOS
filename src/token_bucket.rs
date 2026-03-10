@@ -46,7 +46,15 @@ impl TokenBucketLimiter for TokenBucket {
         // 1. 先补水
         self.refill();
 
-        // println!("[{}]当前需要扣除令牌 {}，现有{}", self.name, amount, self.tokens);
+        // if self.count == u8::MAX && self._name == "Global" {
+        //     println!(
+        //         "[{}]当前需要扣除令牌 {}，现有{}",
+        //         self._name, amount, self.tokens
+        //     );
+        //     self.count = 0;
+        // } else {
+        //     self.count += 1;
+        // }
         let amount = amount as f64;
 
         // 2. 再判断

@@ -45,11 +45,11 @@ where
         None
     }
 
-    fn dequeue(&mut self) -> Option<PacketContext<T, K>> {
-        // 🚀 盲提货：省去所有重新计算 reserve 和 can_spend 的逻辑
-        let ctx = self.inner.dequeue()?;
-        self.bucket.consume(ctx.cost); // 只扣净重
-        Some(ctx)
+    fn dequeue(&mut self) -> PacketContext<T, K> {
+        // 🚀 既然 peek 刚算过账，直接扣钱提包！
+        let ctx = self.inner.dequeue();
+        self.bucket.consume(ctx.cost);
+        ctx
     }
 
     fn collect_dropped(&mut self) -> Vec<PacketContext<T, K>> {

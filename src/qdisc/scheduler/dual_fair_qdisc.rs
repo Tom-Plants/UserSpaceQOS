@@ -78,16 +78,16 @@ impl<T, K> Qdisc<T, K> for DualFairQdisc<T, K> {
         }
     }
 
-    fn dequeue(&mut self) -> Option<PacketContext<T, K>> {
-        // 🚀 盲提货：peek 停在谁的回合，就扣谁的钱！
+    fn dequeue(&mut self) -> PacketContext<T, K> {
+        // 🚀 极致信任：peek 停在谁的回合，谁就 100% 有货有钱！
         if self.turn_a {
-            let ctx = self.q_a.dequeue()?;
+            let ctx = self.q_a.dequeue();
             self.deficit_a -= ctx.cost as i32;
-            Some(ctx)
+            ctx
         } else {
-            let ctx = self.q_b.dequeue()?;
+            let ctx = self.q_b.dequeue();
             self.deficit_b -= ctx.cost as i32;
-            Some(ctx)
+            ctx
         }
     }
 

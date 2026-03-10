@@ -48,7 +48,7 @@ impl<T, K: Clone + std::hash::Hash + Eq> Qdisc<T, K> for TcpAckFilterQdisc<T, K>
                     if let Some(&(highest, _)) = self.highest_acks.get(&ctx.key) {
                         if highest.wrapping_sub(ctx.tcp_ack_num) as i32 > 0 {
                             // 发现过期 ACK，行使超度权！
-                            let dead = self.inner.dequeue().unwrap();
+                            let dead = self.inner.dequeue();
                             self.dropped.push(dead);
                             continue; // 继续查探下一个包
                         }
@@ -60,7 +60,7 @@ impl<T, K: Clone + std::hash::Hash + Eq> Qdisc<T, K> for TcpAckFilterQdisc<T, K>
         }
     }
 
-    fn dequeue(&mut self) -> Option<PacketContext<T, K>> {
+    fn dequeue(&mut self) -> PacketContext<T, K> {
         // 🚀 盲目信任提货
         self.inner.dequeue()
     }

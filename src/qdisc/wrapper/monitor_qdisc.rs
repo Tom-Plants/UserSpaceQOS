@@ -181,24 +181,19 @@ impl<T, K> Qdisc<T, K> for MonitorQdisc<T, K> {
         self.inner.peek()
     }
 
-    fn dequeue(&mut self) -> Option<PacketContext<T, K>> {
-        let result = self.inner.dequeue();
+    fn dequeue(&mut self) -> PacketContext<T, K> {
+        let ctx = self.inner.dequeue();
 
-        // 正常出队，核销积压水位
-        if let Some(ref ctx) = result {
-            let stat = self
-                .stats
-                .entry(ctx.queue_num)
-                .or_insert_with(QueueStats::default);
-            stat.out_pkts += 1;
-            stat.out_bytes += ctx.cost as f64;
-            stat.backlog_pkts -= 1;
-            stat.backlog_bytes -= ctx.cost as i64;
-        }
+        // 🚀 正常出队，核销积压水位
+        let stat = self.stats.entry(ctx.queue_num).or_insert_with(QueueStats::default);
+        stat.out_pkts += 1;
+        stat.out_bytes += ctx.cost as f64;
+        stat.backlog_pkts -= 1;
+        stat.backlog_bytes -= ctx.cost as i64;
 
         self.flush_internal_drops();
         self.check_and_report();
-        result
+        ctx
     }
 
     fn collect_dropped(&mut self) -> Vec<PacketContext<T, K>> {

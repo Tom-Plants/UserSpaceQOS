@@ -51,13 +51,13 @@ fn main() {
     let global_burst = 1024.0 * 290.0;
     let global_bucket = TokenBucket::new(global_rate, global_burst, "Global");
 
-    let high_priority_rate = 1.0 * 1000.0 * 1000.0 / 8.0;
-    let high_priority_burst = 1024.0 * 200.0;
+    let high_priority_rate = 6.0 * 1000.0 * 1000.0 / 8.0;
+    let high_priority_burst = 1024.0 * 90.0;
     let high_priority_bucket =
         TokenBucket::new(high_priority_rate, high_priority_burst, "high_priority");
 
-    let low_priority_rate = 0.2 * 1000.0 * 1000.0 / 8.0;
-    let low_priority_burst = 1024.0 * 90.0;
+    let low_priority_rate = 0.5 * 1000.0 * 1000.0 / 8.0;
+    let low_priority_burst = 1024.0 * 200.0;
     let low_priority_bucket =
         TokenBucket::new(low_priority_rate, low_priority_burst, "low_priority");
 
@@ -212,20 +212,16 @@ fn main() {
         }
 
         loop {
-            let mut send_work_done = false;
-
-            if let Some(msg) = pipeline.dequeue() {
-                send_work_done = true;
+            if pipeline.peek().is_some() {
+                let msg = pipeline.dequeue();
 
                 let mut inner_msg: InnerMessage = msg.msg.into();
                 inner_msg.set_verdict(Verdict::Accept);
                 queues[msg.queue_num].verdict(inner_msg).ok();
-            }
 
-            if !send_work_done {
-                break;
-            } else {
                 working = true;
+            } else {
+                break;
             }
         }
 

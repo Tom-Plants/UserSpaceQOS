@@ -12,6 +12,7 @@ pub struct PrioQdisc<T, K> {
     // 🚀 核心：闭包分类器
     // 接收包的上下文面单，返回 true 进高优，返回 false 进低优
     classifier: Box<dyn Fn(&PacketContext<T, K>) -> bool>,
+    last_peek_high: bool, // 🚀 核心
 }
 
 impl<T, K> PrioQdisc<T, K> {
@@ -24,6 +25,7 @@ impl<T, K> PrioQdisc<T, K> {
             high_qdisc,
             low_qdisc,
             classifier,
+            last_peeked_high: true,
         }
     }
 }
@@ -41,17 +43,17 @@ impl<T, K> Qdisc<T, K> for PrioQdisc<T, K> {
     }
 
     fn peek(&mut self) -> Option<&PacketContext<T, K>> {
-        // 高优看得到，就锁死高优；看不到才轮到低优
         if self.high_qdisc.peek().is_some() {
+            self.last_peek_high = true;
             self.high_qdisc.peek()
         } else {
+            self.last_peek_high = false;
             self.low_qdisc.peek()
         }
     }
 
-    fn dequeue(&mut self) -> Option<PacketContext<T, K>> {
-        // 盲提货：peek 看的是谁，就提谁！
-        if self.high_qdisc.peek().is_some() {
+    fn dequeue(&mut self) -> PacketContext<T, K> {
+        if self.last_peek_high {
             self.high_qdisc.dequeue()
         } else {
             self.low_qdisc.dequeue()
