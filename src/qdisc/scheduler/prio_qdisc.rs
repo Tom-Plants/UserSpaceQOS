@@ -25,7 +25,7 @@ impl<T, K> PrioQdisc<T, K> {
             high_qdisc,
             low_qdisc,
             classifier,
-            last_peeked_high: true,
+            last_peek_high: true,
         }
     }
 }

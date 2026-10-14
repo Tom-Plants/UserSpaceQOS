@@ -8,3 +8,16 @@ libc = "0.2"
 nfq = "0.2.5"
 lazy_static = "1.4"
 chrono = "0.4.44"
+toml = "1.1.8"
+serde = { version = "1.0.229", features = ["derive"] }
+
+# 两个后端，同一套整形逻辑：
+#   nfq_shaper —— 原来的 NFQUEUE 版（iptables 把包丢进队列）
+#   tun_shaper —— TUN 版（路由把包灌进 tun）
+[[bin]]
+name = "nfq_shaper"
+path = "src/main.rs"
+
+[[bin]]
+name = "tun_shaper"
+path = "src/tun_main.rs"

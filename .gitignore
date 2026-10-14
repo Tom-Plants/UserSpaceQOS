@@ -1,1 +1,7 @@
 /target
+/target
+/vendor
+/.cargo
+/*.log
+/state
+/watch.sh

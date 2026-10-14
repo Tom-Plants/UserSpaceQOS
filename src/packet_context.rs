@@ -16,4 +16,8 @@ pub struct PacketContext<T, K> {
     pub frames: usize,
     pub is_pure_ack: bool,
     pub tcp_ack_num: u32,
+
+    /// 这个包是从哪条 [[path]] 进来的（决定整形完往哪个 tun_out 写）
+    /// NFQUEUE 版恒为 0（它没有多路的概念）
+    pub path_id: usize,
 }

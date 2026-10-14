@@ -1,0 +1,160 @@
+# /root/qos_tun/qos.toml —— 生产机（10.11.12.1）上的 UserSpaceQOS 配置
+# 部署日期 2026-10-13
+#
+# 这份配置现在是"**完全待命**"状态，目的只有一个：把程序放进来、验证它能起来、
+# 且**不碰任何流量**（没有任何 ip rule / 路由指向 tun）。
+#
+#   * targets = []    → 控制环完全不启用（连一个探针都不发，WAN 上不新增任何流量）
+#   * dry_run = true  → 将来填了 targets 也只算不动桶
+#
+# 要接流量时的顺序（那一步会先把命令原文贴给你确认）：
+#   ① 填上 targets 并重启程序（探针开始工作，仍然 dry_run）
+#   ② 加 ip rule + 表路由，把某一条路径的流量引进来
+#   ③ 观察；要真限速再把 dry_run 改成 false 热重载
+#
+# 回滚：删掉一条 ip rule（流量立刻回原路）→ 停程序 → 删 /root/qos_tun 目录
+#       全程不用碰 iptables
+
+# ─────────────── 控制环 ───────────────
+[control]
+# 探测目标 = 对端的**隧道地址**（ICMP 走 WG 隧道，不被 ISP 区别对待）。
+# 下面是部署时实测在线的几个 peer，取消注释即可启用：
+# targets = ["10.11.12.2", "10.11.12.6", "10.11.12.10", "10.11.12.3"]
+targets = ["10.11.12.6", "10.11.13.3"]
+probe_interval_s = 0.2
+target_delay_ms = 10.0
+band_ms = 3.0
+min_rate_mbps = 0.5
+max_rate_mbps = 10.0
+up_gain = 1.001                 # 慢回：每拍+0.1%(≈+0.4%/秒)，在5.8~6.6M黄金区多待5倍时间
+down_gain = 0.93                # 温和单步降(-7%：6.5M->6.05M，不伤5M串流)
+creep_gain = 1.0005
+hold_after_cut_s = 6            # 认账后保持不升速的秒数（砍速站得住的时长）
+udp_probe_targets = ["10.11.12.6", "10.11.13.3"]   # 双目标取min（过滤单条腿自己的丢包）
+udp_probe_port = 15390
+udp_probe_interval_ms = 200           # 5 发/秒
+loss_threshold = 0.05                  # 双目标min真丢包门槛：≤6.45M时为0%，超6.5M时升至10~30%
+loss_threshold_hard = 0.22           # 重丢包门槛(22%)：不等观察期快降
+down_gain_hard = 0.92           # 快降单步(-8%：6.5M->5.98M)
+udp_probe_burst_pkts = 20            # 突发瘦身：20个×800B(≈80kbps)，减少自伤
+udp_probe_burst_ms = 2000
+udp_probe_pkt_bytes = 800
+control_ms = 250.0
+base_window_s = 600.0
+dry_run = false
+
+# ─────────────── 每帧开销自校准 ───────────────
+[calibration]
+enabled = true
+state_file = "/root/qos_tun/state"
+sample_window_s = 120
+min_samples = 8
+min_spread = 3.0
+max_overhead = 2000.0
+
+# ─────────────── 积木（沿用你现有的调参比例与时间常数）───────────────
+[[pool]]
+name = "default"
+# ⚠️ dry_run 下桶不调整，但仍按这个值在限 —— 给足，避免"以为只是观测"却偷偷限速
+initial_total_mbps = 10.0
+
+[[pool.bucket]]
+name = "Global"
+role = "total"
+tau_ms = 344.0
+
+[[pool.bucket]]
+name = "high_priority"
+role = "share"
+share = 0.95
+tau_ms = 198.0
+
+[[pool.bucket]]
+name = "low_priority"
+role = "share"
+share = 0.05
+tau_ms = 1320.0
+
+# ─────────────── 路径（先只声明一条，等接流量时再用）───────────────
+[[path]]
+name = "wan_uplink"
+tun_in = "qos_in"
+tun_out = "qos_out"
+class = 5          # 对应原来 "-o eth0" 那两条 NFQUEUE 的语义（默认叶）
+pool = "default"
+
+# ── peer↔peer 中继专用：走 class 2（高优短叶，10ms 队列）──
+# 复原 nfq 时代 q2 的语义（-i wg1 -o wg1 的 UDP 中继延迟极小）
+[[path]]
+name = "relay"
+tun_in = "qos_in2"
+tun_out = "qos_out2"
+class = 2
+pool = "default"
+
+# ─────────── 叶子（队列）参数（2026-10-14 部署）───────────
+# ttl_ms = 0 表示不挂 TtlDropWrapper；低优(下载)走 TCP，让它自己用丢包做拥塞控制
+[leaves]
+high_ttl_ms = 200
+high_fifo_pkts = 2048
+high_long_ttl_ms = 100
+low_bulk_ttl_ms = 0          # ★ 低优批量(下载)不挂 TTL
+low_bulk_fifo_pkts = 64      # ★ 低优最多积压 64 包 ≈ 96KB（按 BDP+余量）
+low_sparse_ttl_ms = 200
+low_sparse_fifo_pkts = 2048
+
+# ── 可组合调度树（[qdisc.<节点名>]，入口固定为 [qdisc.root]）────────────────
+# 若删除或注释掉 [qdisc.root]，程序启动会打印警告并回退到默认尾丢弃 TailDropFifo(limit=300)。
+
+[qdisc.hi_short]
+type = "head_drop"
+limit = 2048
+ttl_ms = 200
+
+[qdisc.hi_long_bulk]
+type = "drr"
+by = "flow"
+quantum = 1500
+ack_filter = true
+child = { type = "head_drop", limit = 2048 }
+
+[qdisc.hi_long]
+type = "sparse"
+ttl_ms = 100
+sparse = { type = "head_drop", limit = 2048 }
+bulk   = "hi_long_bulk"
+
+[qdisc.high_tree]
+type = "dual_fair"
+quantum = 1500
+a_classes = [2]
+a = "hi_short"
+b = "hi_long"
+
+[qdisc.lo_per_flow]
+type = "drr"
+by = "flow"
+quantum = 1500
+child = { type = "head_drop", limit = 64 }
+
+[qdisc.lo_per_host]
+type = "drr"
+by = "src_or_dst_by_class"
+quantum = 1500
+ack_filter = true
+ttl_ms = 0
+child = "lo_per_flow"
+
+[qdisc.low_tree]
+type = "sparse"
+sparse = { type = "head_drop", limit = 2048, ttl_ms = 200 }
+bulk   = "lo_per_host"
+
+[qdisc.root]
+type = "htb"
+global_bucket = "Global"
+high_bucket   = "high_priority"
+low_bucket    = "low_priority"
+high_classes  = [2, 3]
+high = "high_tree"
+low  = "low_tree"

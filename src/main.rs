@@ -1,18 +1,24 @@
 use std::{
     collections::HashMap,
+    sync::atomic::AtomicUsize,
+    sync::Arc,
     time::{Duration, Instant},
 };
 // 引入模块
 mod five_tuple;
 mod modifier;
 mod nfq_message;
+mod overhead_cal;
 mod packet_context;
 mod qdisc;
+mod rate_control;
 mod token_bucket;
+mod udp_probe;
 
 use five_tuple::FiveTuple;
 use nfq::{Message as InnerMessage, Queue, Verdict};
-use token_bucket::TokenBucket;
+use rate_control::RttController;
+use token_bucket::SharedBucket;
 
 use crate::{
     modifier::{
@@ -30,7 +36,8 @@ use crate::{
 };
 
 const OVERHEAD: usize = 14 + 4 + 20 + 60;
-const OVERHEAD2: usize = 18 + 20;
+//const OVERHEAD2: usize = 18 + 20 + 10;
+const OVERHEAD2: usize = OVERHEAD;
 
 const WG_MTU: usize = 1280;
 const ETH_MTU: usize = 1500;
@@ -49,17 +56,38 @@ fn make_queue(queue_num: usize) -> Result<Queue, std::io::Error> {
 fn main() {
     let global_rate = 6.9 * 1000.0 * 1000.0 / 8.0;
     let global_burst = 1024.0 * 290.0;
-    let global_bucket = TokenBucket::new(global_rate, global_burst, "Global");
+    let global_bucket = SharedBucket::new(global_rate, global_burst, "Global");
 
     let high_priority_rate = 6.0 * 1000.0 * 1000.0 / 8.0;
-    let high_priority_burst = 1024.0 * 90.0;
+    let high_priority_burst = 1024.0 * 145.0;
     let high_priority_bucket =
-        TokenBucket::new(high_priority_rate, high_priority_burst, "high_priority");
+        SharedBucket::new(high_priority_rate, high_priority_burst, "high_priority");
 
-    let low_priority_rate = 0.5 * 1000.0 * 1000.0 / 8.0;
-    let low_priority_burst = 1024.0 * 200.0;
+    let low_priority_rate = 0.9 * 1000.0 * 1000.0 / 8.0;
+    let low_priority_burst = 1024.0 * 145.0;
     let low_priority_bucket =
-        TokenBucket::new(low_priority_rate, low_priority_burst, "low_priority");
+        SharedBucket::new(low_priority_rate, low_priority_burst, "low_priority");
+
+    // 🎚️ 容量控制环。HtbQdisc 拿走的是桶的克隆，这里留一份用来在运行中改速率。
+    //    构造时按你原来的调参捕获了「各桶占比」和「burst/rate 秒数」，所以缩放不会破坏你的手感。
+    //    没设 NFQ_TARGETS 时整个控制环不启用 → 行为与固定速率时一字不差。
+    // NFQUEUE 版保持原样：开销仍然是写死的常数
+    // （它一次管两条路——进隧道的内层包和出物理口的外层帧，开销本来就不同，
+    //  单值自校准会互相污染，所以那边 cal=false，行为与以前一模一样）
+    // 两个口径各给一个能被在线改写的每帧开销。
+    // NFQUEUE 版不启用自校准（值固定），但类型统一成 Arc<AtomicUsize>，
+    // 这样和 TUN 版那套"自校准直接改 modifier"共用同一条代码路径。
+    let ovh_wg = Arc::new(AtomicUsize::new(OVERHEAD));
+    let ovh_eth = Arc::new(AtomicUsize::new(OVERHEAD2));
+    let mut controller = RttController::from_env(
+        vec![
+            global_bucket.clone(),
+            high_priority_bucket.clone(),
+            low_priority_bucket.clone(),
+        ],
+        ovh_wg.clone(),
+        false,
+    );
 
     let mut modifiers: HashMap<usize, Vec<Box<dyn PacketModifier<_, _>>>> = HashMap::new();
 
@@ -71,7 +99,7 @@ fn main() {
                 Box::new(TcpAckModifier::new()),
                 Box::new(PaddingModifier::new(16)),
                 Box::new(FragmentModifier::new(WG_MTU)),
-                Box::new(OverheadModifier::new(OVERHEAD)),
+                Box::new(OverheadModifier::new(ovh_wg.clone())),
             ],
         );
     }
@@ -83,7 +111,7 @@ fn main() {
                 Box::new(TrueLengthModifier::new()),
                 Box::new(TcpAckModifier::new()),
                 Box::new(FragmentModifier::new(ETH_MTU)),
-                Box::new(OverheadModifier::new(OVERHEAD2)),
+                Box::new(OverheadModifier::new(ovh_eth.clone())),
             ],
         );
     }
@@ -191,6 +219,7 @@ fn main() {
                             frames: 1,
                             is_pure_ack: false,
                             tcp_ack_num: 0,
+                            path_id: 0,
                         };
 
                         if let Some(modifiers) = modifiers.get(&queue_num) {
@@ -234,6 +263,11 @@ fn main() {
                 queues[ctx.queue_num].verdict(msg).ok();
             }
         }
+
+        // 🎚️ 先把"这一轮处理了多少包"喂给控制环（空载时它不该升速），再问它新容量。
+        //    未设 NFQ_TARGETS 时两步都是空操作，零开销。
+        controller.add_packets(packet_count as u64);
+        controller.tick();
 
         if !working {
             std::thread::sleep(Duration::from_micros(100)); // 稍微缩短 sleep 时间以提高响应
