@@ -1,18 +1,13 @@
 # /root/qos_tun/qos.toml —— 生产机（10.11.12.1）上的 UserSpaceQOS 配置
-# 部署日期 2026-10-13
+# 部署日期 2026-10-13；调度树改造 2026-10-15（代码 ≥ 6eca71d）
 #
-# 这份配置现在是"**完全待命**"状态，目的只有一个：把程序放进来、验证它能起来、
-# 且**不碰任何流量**（没有任何 ip rule / 路由指向 tun）。
+# 现役状态（2026-10-15）：**全面上线运行中** —— 控制环启用、7 条 ip rule 罩住 wg1 等，
+# 高低优共存（串流高优 / 下载低优）、UDP 丢包探针、快降慢回均已在跑。
 #
-#   * targets = []    → 控制环完全不启用（连一个探针都不发，WAN 上不新增任何流量）
-#   * dry_run = true  → 将来填了 targets 也只算不动桶
+#   * targets / udp_probe_targets ≠ [] → 控制环在工作（会发探针）
+#   * dry_run = false                  → 真限速（C 会被落到桶上）
 #
-# 要接流量时的顺序（那一步会先把命令原文贴给你确认）：
-#   ① 填上 targets 并重启程序（探针开始工作，仍然 dry_run）
-#   ② 加 ip rule + 表路由，把某一条路径的流量引进来
-#   ③ 观察；要真限速再把 dry_run 改成 false 热重载
-#
-# 回滚：删掉一条 ip rule（流量立刻回原路）→ 停程序 → 删 /root/qos_tun 目录
+# 回滚：摘掉 7 条 ip rule（流量立刻回原路）→ screen -S qos_tun -X quit
 #       全程不用碰 iptables
 
 # ─────────────── 控制环 ───────────────
@@ -92,16 +87,23 @@ tun_out = "qos_out2"
 class = 2
 pool = "default"
 
-# ─────────── 叶子（队列）参数（2026-10-14 部署）───────────
-# ttl_ms = 0 表示不挂 TtlDropWrapper；低优(下载)走 TCP，让它自己用丢包做拥塞控制
-[leaves]
-high_ttl_ms = 200
-high_fifo_pkts = 2048
-high_long_ttl_ms = 100
-low_bulk_ttl_ms = 0          # ★ 低优批量(下载)不挂 TTL
-low_bulk_fifo_pkts = 64      # ★ 低优最多积压 64 包 ≈ 96KB（按 BDP+余量）
-low_sparse_ttl_ms = 200
-low_sparse_fifo_pkts = 2048
+# ─────────── [leaves] ⚠️ 已废弃（2026-10-15）───────────
+# 换成 [qdisc.*] 树后本段不再被读取 —— 改这里不会有任何效果！
+# 等价参数现在写进下面的 [qdisc.*]：
+#   high_ttl_ms=200 / high_fifo_pkts=2048   ↔ [qdisc.hi_short]（ttl_ms / limit）
+#   high_long_ttl_ms=100                    ↔ [qdisc.hi_long] ttl_ms
+#   low_bulk_ttl_ms=0                       ↔ [qdisc.lo_per_host] ttl_ms=0（不挂 TTL）
+#   low_bulk_fifo_pkts=64                   ↔ [qdisc.lo_per_flow].child limit=64
+#   low_sparse_ttl_ms=200 / fifo 2048       ↔ [qdisc.low_tree].sparse（ttl_ms / limit）
+# 以下保留历史原文，仅供对照：
+# [leaves]
+# high_ttl_ms = 200
+# high_fifo_pkts = 2048
+# high_long_ttl_ms = 100
+# low_bulk_ttl_ms = 0          # ★ 低优批量(下载)不挂 TTL
+# low_bulk_fifo_pkts = 64      # ★ 低优最多积压 64 包 ≈ 96KB（按 BDP+余量）
+# low_sparse_ttl_ms = 200
+# low_sparse_fifo_pkts = 2048
 
 # ── 可组合调度树（[qdisc.<节点名>]，入口固定为 [qdisc.root]）────────────────
 # 若删除或注释掉 [qdisc.root]，程序启动会打印警告并回退到默认尾丢弃 TailDropFifo(limit=300)。
